@@ -19,6 +19,7 @@ import mimetypes
 import os
 import re
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
@@ -264,9 +265,11 @@ def api_fs_delete(ctx):
     path = body.get("path", "")
     ctx.require_perm(path, "delete")
     item = ctx.nn.fs.delete_to_trash(path, ctx.actor())
+    expires_text = time.strftime(
+        "%Y-%m-%d %H:%M:%S", time.localtime(item["expires_at"]))
     ctx.nn.log_event("WARN", "fs", "delete", path, ctx.actor(),
-                     f"移入回收站（{item['retention_days']} 天后过期），"
-                     f"条目 {item['id']}")
+                     f"移入回收站（{item['retention_days']} 天保留期，"
+                     f"{expires_text} 到期），条目 {item['id']}")
     return {"ok": True, "item": item}
 
 

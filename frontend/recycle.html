@@ -7,6 +7,16 @@
 <link rel="stylesheet" href="css/app.css">
 <style>
   .exp-bar { width:110px; }
+  .exp-cell { min-width:150px; }
+  .expiry-cell { min-width:165px; }
+  .sort-btn {
+    margin-left: 4px; padding: 1px 6px; font-size: 11px;
+    border: 1px solid var(--border); border-radius: 4px;
+    background: transparent; color: var(--muted); cursor: pointer;
+  }
+  .sort-btn:hover { color: var(--text); border-color: var(--muted); }
+  .tbl tr.urgent > td { background: rgba(240, 165, 56, .06); }
+  .tbl tr.critical > td { background: rgba(229, 83, 75, .08); }
   .item-name { font-weight:600; }
   .orig-path { font-family:var(--mono); font-size:11.5px; color:var(--muted); }
 </style>
@@ -37,7 +47,12 @@
         <div class="table-wrap"><table class="tbl">
           <thead><tr>
             <th>名称</th><th>类型</th><th>原路径</th><th class="right">大小</th>
-            <th>删除者</th><th>删除时间</th><th>剩余保留期</th><th>操作</th>
+            <th>删除者</th><th>删除时间</th>
+            <th>剩余保留期
+              <button class="sort-btn" id="sort-remain" type="button"
+                title="按剩余保留期排序">默认 ▾</button>
+            </th>
+            <th>到期时间</th><th>操作</th>
           </tr></thead>
           <tbody id="item-body"></tbody>
         </table></div>
@@ -86,31 +101,64 @@ function renderSum(s) {
     </div>`).join("");
 }
 
+let currentItems = [];
+let remainSort = "";   // ""=按删除时间（默认），asc=剩余时间升序，desc=剩余时间降序
+
+function remainingSeconds(item) {
+  return (item.expires_at || 0) - Date.now() / 1000;
+}
+
 function countdownHtml(item) {
-  const remain = (item.expires_at || 0) - Date.now() / 1000;
-  if (remain <= 0) return `<span class="countdown now">即将清理</span>
-    <div class="pbar thin bad exp-bar"><i style="width:100%"></i></div>`;
+  const remain = remainingSeconds(item);
   const total = (item.retention_days || 7) * 86400;
-  const pct = Math.max(0, Math.min(100, (1 - remain / total) * 100));
+  if (remain <= 0) return `<span class="countdown now">即将清理</span>
+    <div class="pbar thin bad exp-bar" title="保留期已耗尽"><i style="width:0%"></i></div>`;
+  const pct = Math.max(0, Math.min(100, remain / total * 100));
   const cls = remain < 3600 ? "now" : remain < 86400 ? "soon" : "";
   const barCls = remain < 3600 ? "bad" : remain < 86400 ? "warn" : "ok";
   let txt;
   if (remain > 86400) txt = `${(remain / 86400).toFixed(1)} 天`;
   else if (remain > 3600) txt = `${(remain / 3600).toFixed(1)} 小时`;
-  else txt = `${Math.round(remain / 60)} 分钟`;
+  else txt = `${Math.max(1, Math.round(remain / 60))} 分钟`;
   return `<span class="countdown ${cls}">${txt}</span>
-    <div class="pbar thin ${barCls} exp-bar"><i style="width:${pct}%"></i></div>`;
+    <div class="pbar thin ${barCls} exp-bar" title="剩余 ${pct.toFixed(1)}%"><i style="width:${pct}%"></i></div>`;
+}
+
+function expiryHtml(item) {
+  const remain = remainingSeconds(item);
+  let badge = "";
+  if (remain <= 0) badge = '<span class="badge bad plain">待清理</span>';
+  else if (remain < 3600) badge = '<span class="badge bad plain">1 小时内</span>';
+  else if (remain < 86400) badge = '<span class="badge warn plain">24 小时内</span>';
+  return `<div class="small dim nowrap">${fmtTs(item.expires_at)}</div>${badge}`;
+}
+
+function sortedItems(items) {
+  const out = items.slice();
+  if (remainSort === "asc") out.sort((a, b) => (a.expires_at || 0) - (b.expires_at || 0));
+  if (remainSort === "desc") out.sort((a, b) => (b.expires_at || 0) - (a.expires_at || 0));
+  return out;
+}
+
+function updateSortButton() {
+  const btn = document.getElementById("sort-remain");
+  btn.textContent = remainSort === "asc" ? "剩余少 ▲"
+    : remainSort === "desc" ? "剩余多 ▼" : "默认 ▾";
 }
 
 function renderItems(items) {
+  currentItems = items;
   const body = document.getElementById("item-body");
   if (!items.length) {
-    body.innerHTML = `<tr><td colspan="8" class="empty">
+    body.innerHTML = `<tr><td colspan="9" class="empty">
       <div class="big">🗑</div>回收站是空的</td></tr>`;
     return;
   }
-  body.innerHTML = items.map(it => `
-    <tr>
+  body.innerHTML = sortedItems(items).map(it => {
+    const remain = remainingSeconds(it);
+    const rowCls = remain <= 3600 ? "critical" : remain <= 86400 ? "urgent" : "";
+    return `
+    <tr class="${rowCls}">
       <td>
         <span class="item-name">${it.type === "dir" ? "🗀" : "🗎"} ${esc(it.name)}</span>
         ${it.type === "dir" ? `<span class="badge dim plain">${it.files} 文件</span>` : ""}
@@ -120,12 +168,14 @@ function renderItems(items) {
       <td class="num right">${fmtBytes(it.size)}</td>
       <td class="small">${esc(it.deleted_by || "-")}</td>
       <td class="small dim nowrap" title="${fmtTs(it.deleted_at)}">${fmtAgo(it.deleted_at)}</td>
-      <td>${countdownHtml(it)}</td>
+      <td class="exp-cell">${countdownHtml(it)}</td>
+      <td class="expiry-cell">${expiryHtml(it)}</td>
       <td class="nowrap">
         <button class="btn xs ok it-restore" data-id="${esc(it.id)}" data-n="${esc(it.name)}">↩ 恢复</button>
         <button class="btn xs danger it-purge" data-id="${esc(it.id)}" data-n="${esc(it.name)}">彻底删除</button>
       </td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
   body.querySelectorAll(".it-restore").forEach(b => b.onclick = async () => {
     try {
       const r = await api("POST", "/api/recycle/restore", { id: b.dataset.id });
@@ -154,6 +204,13 @@ document.getElementById("btn-empty").onclick = () =>
   }, true);
 
 document.getElementById("btn-refresh").onclick = load;
+
+document.getElementById("sort-remain").onclick = () => {
+  remainSort = remainSort === "" ? "asc" : remainSort === "asc" ? "desc" : "";
+  updateSortButton();
+  renderItems(currentItems);
+};
+updateSortButton();
 
 initPage("recycle.html", "回收站").then(() => {
   load();

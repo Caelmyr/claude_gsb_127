@@ -25,7 +25,7 @@ filesystem.py — 虚拟文件系统（inode 树 + 回收站）
 import threading
 
 from . import config
-from .util import gen_id, join_path, norm_path, now, safe_name, ttl_seconds
+from .util import gen_id, join_path, norm_path, now, safe_name
 
 
 class FsError(Exception):
@@ -58,8 +58,40 @@ class VirtualFS:
                 fs["root"] = "in_root"
                 fs["trash_root"] = "in_trash"
                 self.meta.touch("fs")
+            self._normalize_trash_retention()
             self.root_id = fs["root"]
             self.trash_id = fs["trash_root"]
+
+    def _normalize_trash_retention(self):
+        """统一回收站 TTL：retention_days 必须按天计算。"""
+        rec = self.meta.get("recycle")
+        retention = rec.get("retention_days", config.TRASH_RETENTION_DAYS)
+        expected_ttl = retention * 86400
+        changed = False
+
+        if rec.get("retention_unit", "days") != "days":
+            rec["retention_unit"] = "days"
+            changed = True
+
+        for item in rec.get("items", {}).values():
+            deleted_at = item.get("deleted_at")
+            expires_at = item.get("expires_at")
+            if not deleted_at or not expires_at:
+                continue
+            actual_ttl = expires_at - deleted_at
+            # 修复早期版本把 7 天误按小时计算而产生的短 TTL 记录；保留少量
+            # 时间误差，避免把手工构造/跨秒写入的正常记录误判为脏数据。
+            if 0 < actual_ttl < expected_ttl - 60:
+                item["expires_at"] = deleted_at + expected_ttl
+                item["retention_days"] = retention
+                item["retention_unit"] = "days"
+                changed = True
+            elif item.get("retention_unit") != "days":
+                item["retention_unit"] = "days"
+                changed = True
+
+        if changed:
+            self.meta.touch("recycle")
 
     # ---------------------------------------------------------------- 解析
     def _inodes(self):
@@ -395,8 +427,8 @@ class VirtualFS:
                 "deleted_at": now(),
                 "deleted_by": actor,
                 "retention_days": retention,
-                "expires_at": now() + ttl_seconds(
-                    retention, config.TRASH_RETENTION_UNIT),
+                "retention_unit": "days",
+                "expires_at": now() + retention * 86400,
                 "size": stats["bytes"],
                 "files": stats["files"],
                 "blocks": stats["blocks"],
@@ -492,16 +524,21 @@ class VirtualFS:
                 count += 1
             return {"purged": count, "freed_blocks": freed}
 
-    def purge_expired(self):
+    def purge_expired(self, include_items=False):
         """清理超过保留期的条目（后台线程周期调用）。"""
         t = now()
         with self.meta.lock:
             rec = self._recycle()
-            expired = [iid for iid, it in rec.get("items", {}).items()
-                       if it.get("expires_at", 0) < t]
+            expired_items = {
+                iid: dict(it)
+                for iid, it in rec.get("items", {}).items()
+                if it.get("expires_at", 0) < t
+            }
             freed = []
-            for iid in expired:
+            for iid in expired_items:
                 freed.extend(self.purge(iid, "system"))
+            expired = (list(expired_items.values()) if include_items
+                       else list(expired_items))
             return expired, freed
 
     def trash_stats(self):
@@ -513,7 +550,7 @@ class VirtualFS:
                 "blocks": sum(i.get("blocks", 0) for i in items.values()),
                 "retention_days": self._recycle().get(
                     "retention_days", config.TRASH_RETENTION_DAYS),
-                "retention_unit": config.TRASH_RETENTION_UNIT,
+                "retention_unit": "days",
             }
 
     # ---------------------------------------------------------------- 汇总

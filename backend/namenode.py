@@ -28,6 +28,7 @@ import json
 import os
 import random
 import threading
+import time
 
 from . import chunking, config
 from .auth import AuthManager, PermissionManager
@@ -1629,14 +1630,29 @@ class NameNode:
         while not self._stop.is_set():
             self._stop.wait(config.TRASH_EXPIRE_CHECK_INTERVAL)
             try:
-                expired, freed = self.fs.purge_expired()
+                expired, freed = self.fs.purge_expired(include_items=True)
+                for item in expired:
+                    expires_at = time.strftime(
+                        "%Y-%m-%d %H:%M:%S",
+                        time.localtime(item.get("expires_at", 0)))
+                    deleted_at = time.strftime(
+                        "%Y-%m-%d %H:%M:%S",
+                        time.localtime(item.get("deleted_at", 0)))
+                    self.log_event(
+                        "INFO", "fs", "trash_expire",
+                        item.get("original_path", ""), "system",
+                        f"回收站条目 {item.get('id')} 到期自动彻底删除："
+                        f"{item.get('name')}，删除时间 {deleted_at}，"
+                        f"到期时间 {expires_at}，"
+                        f"释放 {item.get('blocks', 0)} 个块引用")
                 if expired:
-                    self.log_event("INFO", "fs", "trash_expire", "", "system",
-                                   f"回收站过期清理 {len(expired)} 项（单位 "
-                                   f"{config.TRASH_RETENTION_UNIT}），"
+                    self.log_event("INFO", "fs", "trash_expire_summary", "",
+                                   "system",
+                                   f"回收站过期清理 {len(expired)} 项，"
                                    f"释放 {len(freed)} 个块引用")
-            except Exception:
-                pass
+            except Exception as e:  # noqa: BLE001
+                self.log_event("ERROR", "fs", "trash_expire_error", "",
+                               "system", str(e))
 
     # ==================================================================
     # 块详情（文件详情页：块 -> 副本 -> 节点）
