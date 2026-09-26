@@ -395,6 +395,7 @@ class VirtualFS:
                 "deleted_at": now(),
                 "deleted_by": actor,
                 "retention_days": retention,
+                "retention_unit": config.TRASH_RETENTION_UNIT,
                 "expires_at": now() + ttl_seconds(
                     retention, config.TRASH_RETENTION_UNIT),
                 "size": stats["bytes"],
@@ -493,16 +494,21 @@ class VirtualFS:
             return {"purged": count, "freed_blocks": freed}
 
     def purge_expired(self):
-        """清理超过保留期的条目（后台线程周期调用）。"""
+        """清理超过保留期的条目（后台线程周期调用）。
+
+        返回 (purged_items, freed_block_ids)：purged_items 为被清理条目的
+        快照（含名称/原路径/删除时间/到期时间），供调用方写逐条审计日志。
+        """
         t = now()
         with self.meta.lock:
             rec = self._recycle()
             expired = [iid for iid, it in rec.get("items", {}).items()
                        if it.get("expires_at", 0) < t]
+            purged_items = [dict(rec["items"][iid]) for iid in expired]
             freed = []
             for iid in expired:
                 freed.extend(self.purge(iid, "system"))
-            return expired, freed
+            return purged_items, freed
 
     def trash_stats(self):
         with self.meta.lock:

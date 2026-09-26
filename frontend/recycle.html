@@ -9,6 +9,10 @@
   .exp-bar { width:110px; }
   .item-name { font-weight:600; }
   .orig-path { font-family:var(--mono); font-size:11.5px; color:var(--muted); }
+  th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
+  th.sortable .arr { color:var(--accent); margin-left:3px; font-size:10px; }
+  tr.row-soon td { background:rgba(201,138,32,.07); }
+  tr.row-now td { background:rgba(176,58,52,.10); }
 </style>
 </head>
 <body>
@@ -37,7 +41,9 @@
         <div class="table-wrap"><table class="tbl">
           <thead><tr>
             <th>名称</th><th>类型</th><th>原路径</th><th class="right">大小</th>
-            <th>删除者</th><th>删除时间</th><th>剩余保留期</th><th>操作</th>
+            <th>删除者</th><th>删除时间</th>
+            <th class="sortable" id="th-remain">剩余保留期<span class="arr" id="remain-arr">▲</span></th>
+            <th>到期时间</th><th>操作</th>
           </tr></thead>
           <tbody id="item-body"></tbody>
         </table></div>
@@ -63,19 +69,33 @@
 "use strict";
 const { api, esc, fmtBytes, fmtTs, fmtAgo, toast, confirmDlg, fileIcon } = DFSVS;
 
+// 与后端 ttl_seconds 的单位换算保持一致，避免前后端各按各的单位走
+const UNIT_SECONDS = { seconds: 1, minutes: 60, hours: 3600, days: 86400 };
+const UNIT_LABEL = { seconds: "秒", minutes: "分钟", hours: "小时", days: "天" };
+// 临期阈值（秒）：不足 24h 提醒，不足 1h 紧急
+const SOON_SECONDS = 86400;
+const NOW_SECONDS = 3600;
+
+// 剩余保留期排序：asc = 最快到期的排最前（默认），desc = 最安全的排最前
+let remainSort = "asc";
+let lastItems = [];
+
 async function load() {
   try {
     const d = await api("GET", "/api/recycle");
     renderSum(d.stats);
-    renderItems(d.items);
+    lastItems = d.items || [];
+    renderItems();
   } catch (e) { toast(e.message, "bad"); }
 }
 
 function renderSum(s) {
+  const unit = s.retention_unit || "days";
+  const unitLabel = UNIT_LABEL[unit] || unit;
   const cells = [
     { label: "待恢复条目", value: s.count, sub: "含目录（整体删除/恢复）", cls: s.count ? "warn" : "ok" },
     { label: "占用逻辑空间", value: fmtBytes(s.bytes), sub: `涉及 ${s.blocks} 个块引用`, cls: "" },
-    { label: "保留期", value: s.retention_days + " 天", sub: "到期自动彻底删除", cls: "" },
+    { label: "保留期", value: `${s.retention_days} ${unitLabel}`, sub: "到期自动彻底删除", cls: "" },
     { label: "块回收", value: "GC", sub: "宽限期 45s · 每 20s 扫描", cls: "accent" },
   ];
   document.getElementById("sum-row").innerHTML = cells.map(c => `
@@ -86,31 +106,62 @@ function renderSum(s) {
     </div>`).join("");
 }
 
-function countdownHtml(item) {
-  const remain = (item.expires_at || 0) - Date.now() / 1000;
-  if (remain <= 0) return `<span class="countdown now">即将清理</span>
-    <div class="pbar thin bad exp-bar"><i style="width:100%"></i></div>`;
-  const total = (item.retention_days || 7) * 86400;
-  const pct = Math.max(0, Math.min(100, (1 - remain / total) * 100));
-  const cls = remain < 3600 ? "now" : remain < 86400 ? "soon" : "";
-  const barCls = remain < 3600 ? "bad" : remain < 86400 ? "warn" : "ok";
-  let txt;
-  if (remain > 86400) txt = `${(remain / 86400).toFixed(1)} 天`;
-  else if (remain > 3600) txt = `${(remain / 3600).toFixed(1)} 小时`;
-  else txt = `${Math.round(remain / 60)} 分钟`;
-  return `<span class="countdown ${cls}">${txt}</span>
-    <div class="pbar thin ${barCls} exp-bar"><i style="width:${pct}%"></i></div>`;
+// 该条目承诺的完整保留期（秒），单位取自后端配置，数值取删除时快照
+function totalTtl(it) {
+  const unit = it.retention_unit || "days";
+  return (it.retention_days || 7) * (UNIT_SECONDS[unit] || UNIT_SECONDS.days);
 }
 
-function renderItems(items) {
+function remainSeconds(it) {
+  return (it.expires_at || 0) - Date.now() / 1000;
+}
+
+function fmtRemain(remain) {
+  if (remain > 86400) return `${(remain / 86400).toFixed(1)} 天`;
+  if (remain > 3600) return `${(remain / 3600).toFixed(1)} 小时`;
+  if (remain > 60) return `${Math.round(remain / 60)} 分钟`;
+  return `${Math.max(0, Math.round(remain))} 秒`;
+}
+
+function countdownHtml(it) {
+  const remain = remainSeconds(it);
+  if (remain <= 0) return `<span class="countdown now">即将清理</span>
+    <div class="pbar thin bad exp-bar" title="保留期已耗尽，下次后台扫描（≤60s）将彻底删除"><i style="width:100%"></i></div>`;
+  // 进度条表达“保留期已消耗的比例”：剩余越少填得越满、颜色越红
+  const total = totalTtl(it);
+  const pct = total > 0 ? Math.max(0, Math.min(100, (1 - remain / total) * 100)) : 100;
+  const cls = remain < NOW_SECONDS ? "now" : remain < SOON_SECONDS ? "soon" : "";
+  const barCls = remain < NOW_SECONDS ? "bad" : remain < SOON_SECONDS ? "warn" : "ok";
+  const badge = remain < NOW_SECONDS
+    ? ' <span class="badge danger plain">紧急</span>'
+    : remain < SOON_SECONDS ? ' <span class="badge warn plain">临期</span>' : "";
+  return `<span class="countdown ${cls}">${fmtRemain(remain)}</span>${badge}
+    <div class="pbar thin ${barCls} exp-bar" title="保留期已消耗 ${pct.toFixed(1)}% · 到期 ${fmtTs(it.expires_at)}"><i style="width:${pct}%"></i></div>`;
+}
+
+function sortedItems() {
+  const arr = lastItems.slice();
+  arr.sort((a, b) => remainSort === "asc"
+    ? remainSeconds(a) - remainSeconds(b)
+    : remainSeconds(b) - remainSeconds(a));
+  return arr;
+}
+
+function renderItems() {
   const body = document.getElementById("item-body");
+  document.getElementById("remain-arr").textContent = remainSort === "asc" ? "▲" : "▼";
+  const items = sortedItems();
   if (!items.length) {
-    body.innerHTML = `<tr><td colspan="8" class="empty">
+    body.innerHTML = `<tr><td colspan="9" class="empty">
       <div class="big">🗑</div>回收站是空的</td></tr>`;
     return;
   }
-  body.innerHTML = items.map(it => `
-    <tr>
+  body.innerHTML = items.map(it => {
+    const remain = remainSeconds(it);
+    const rowCls = remain <= NOW_SECONDS ? "row-now"
+      : remain < SOON_SECONDS ? "row-soon" : "";
+    return `
+    <tr class="${rowCls}">
       <td>
         <span class="item-name">${it.type === "dir" ? "🗀" : "🗎"} ${esc(it.name)}</span>
         ${it.type === "dir" ? `<span class="badge dim plain">${it.files} 文件</span>` : ""}
@@ -121,11 +172,13 @@ function renderItems(items) {
       <td class="small">${esc(it.deleted_by || "-")}</td>
       <td class="small dim nowrap" title="${fmtTs(it.deleted_at)}">${fmtAgo(it.deleted_at)}</td>
       <td>${countdownHtml(it)}</td>
+      <td class="small dim nowrap" title="后台线程每分钟扫描，到期即彻底删除">${fmtTs(it.expires_at)}</td>
       <td class="nowrap">
         <button class="btn xs ok it-restore" data-id="${esc(it.id)}" data-n="${esc(it.name)}">↩ 恢复</button>
         <button class="btn xs danger it-purge" data-id="${esc(it.id)}" data-n="${esc(it.name)}">彻底删除</button>
       </td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
   body.querySelectorAll(".it-restore").forEach(b => b.onclick = async () => {
     try {
       const r = await api("POST", "/api/recycle/restore", { id: b.dataset.id });
@@ -143,6 +196,11 @@ function renderItems(items) {
         } catch (e) { toast(e.message, "bad"); }
       }, true));
 }
+
+document.getElementById("th-remain").onclick = () => {
+  remainSort = remainSort === "asc" ? "desc" : "asc";
+  renderItems();
+};
 
 document.getElementById("btn-empty").onclick = () =>
   confirmDlg("清空回收站？所有条目将被彻底删除，不可恢复！", async () => {

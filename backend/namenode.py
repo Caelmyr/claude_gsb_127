@@ -33,8 +33,8 @@ from . import chunking, config
 from .auth import AuthManager, PermissionManager
 from .filesystem import FsError, VirtualFS
 from .metadata import MetadataStore
-from .util import (HttpError, LRU, RateCounter, RingBuffer, b64e, gen_id,
-                   guess_mime, hour_key, http_json, http_request,
+from .util import (HttpError, LRU, RateCounter, RingBuffer, b64e, fmt_ts,
+                   gen_id, guess_mime, hour_key, http_json, http_request,
                    is_text_mime, needs_recovery, canonical_access_op,
                    now, parse_range, sha256_bytes, short_hash, split_multi,
                    vv_compare, vv_merge)
@@ -1629,12 +1629,23 @@ class NameNode:
         while not self._stop.is_set():
             self._stop.wait(config.TRASH_EXPIRE_CHECK_INTERVAL)
             try:
-                expired, freed = self.fs.purge_expired()
-                if expired:
-                    self.log_event("INFO", "fs", "trash_expire", "", "system",
-                                   f"回收站过期清理 {len(expired)} 项（单位 "
-                                   f"{config.TRASH_RETENTION_UNIT}），"
-                                   f"释放 {len(freed)} 个块引用")
+                purged_items, freed = self.fs.purge_expired()
+                if purged_items:
+                    for it in purged_items:
+                        self.log_event(
+                            "WARN", "fs", "trash_expire",
+                            it.get("original_path") or it.get("name", ""),
+                            "system",
+                            f"保留期 {it.get('retention_days', 0)} "
+                            f"{config.TRASH_RETENTION_UNIT} 届满，自动彻底删除"
+                            f"（删除者 {it.get('deleted_by', '-')}，"
+                            f"删除于 {fmt_ts(it.get('deleted_at'))}，"
+                            f"到期 {fmt_ts(it.get('expires_at'))}，"
+                            f"条目 {it.get('id')}）")
+                    self.log_event(
+                        "INFO", "fs", "trash_expire_batch", "", "system",
+                        f"回收站过期清理 {len(purged_items)} 项，"
+                        f"释放 {len(freed)} 个块引用")
             except Exception:
                 pass
 
